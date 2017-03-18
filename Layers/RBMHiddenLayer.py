@@ -2,26 +2,33 @@ import theano
 import theano.tensor as T
 import numpy
 
-class RBMHiddenLayer():
+class RBMHiddenLayer:
     def __init__(self,
                  rng,
                  theanoRng,
-                 input = None,
-                 numVisible = 784,
-                 numHidden = 500,
+                 input,
+                 numVisible,
+                 numHidden,
+                 learningRate,
                  activation = T.nnet.sigmoid,
+                 persistent = None,
+                 kGibbsSample = 1,
                  W = None,
-                 h = None,
-                 v = None):
-        self.Rng = rng
-        self.TheanoRng = theanoRng
-        self.Input = input
-        self.NumVisible = numVisible
-        self.NumHidden = numHidden
-        self.Activation = activation
-        self.W = W
-        self.h = h
-        self.v = v
+                 hBias = None,
+                 vBias = None):
+        # Set parameters
+        self.Rng          = rng
+        self.TheanoRng    = theanoRng
+        self.Input        = input
+        self.NumVisible   = numVisible
+        self.NumHidden    = numHidden
+        self.LearningRate = learningRate
+        self.Activation   = activation
+        self.Persistent   = persistent
+        self.kGibbsSample = kGibbsSample
+        self.W            = W
+        self.hBias        = hBias
+        self.vBias        = vBias
 
         self.createModel()
 
@@ -40,9 +47,9 @@ class RBMHiddenLayer():
                 borrow = True
             )
 
-        if self.h is None:
+        if self.hBias is None:
             hBound = numpy.sqrt(6.0 / self.NumHidden)
-            self.h = theano.shared(
+            self.hBias = theano.shared(
                 numpy.asarray(
                     self.Rng.uniform(
                         low  = -hBound,
@@ -54,9 +61,9 @@ class RBMHiddenLayer():
                 borrow = True
             )
 
-        if self.v is None:
+        if self.vBias is None:
             vBound = numpy.sqrt(6.0 / self.NumVisible)
-            self.v = theano.shared(
+            self.vBias = theano.shared(
                 numpy.asarray(
                     self.Rng.uniform(
                         low  = -vBound,
@@ -68,107 +75,86 @@ class RBMHiddenLayer():
                 borrow = True
             )
 
-        self.Params = [self.W, self.h, self.v]
-        self.Cost, self.Update = self.getCostUpdate()
+        self.Params = [self.W, self.hBias, self.vBias]
 
-    def propup(self, visible):
-        preActivation = T.dot(visible, self.W) + self.h
-        afterActivation = self.Activation(preActivation)
-        return [preActivation, afterActivation]
-
-    def sampleHgivenV(self, input):
-        preActivationH1, h1Mean = self.propup(input)
-        h1Sample = self.TheanoRng.binomial(size = h1Mean.shape,
-                                           n = 1, p = h1Mean,
-                                           dtype = theano.config.floatX)
-        return [preActivationH1, h1Mean, h1Sample]
-
-    def propdown(self, hidden):
-        preActivation = T.dot(hidden, self.W.T) + self.v
-        afterActivation = self.Activation(preActivation)
-        return [preActivation, afterActivation]
-
-    def sampleVgivenH(self, input):
-        preActivationV1, v1Mean = self.propdown(input)
-        v1Sample = self.TheanoRng.binomial(size = v1Mean.shape,
-                                           n = 1, p = v1Mean,
-                                           dtype = theano.config.floatX)
-        return [preActivationV1, v1Mean, v1Sample]
-
-    def freeEnergy(self, vSample):
-        wxB = T.dot(vSample, self.W) + self.h
-        vTemp = T.dot(vSample, self.v)
-        hTemp = T.dot(T.log(1 + T.exp(wxB)), axis = 1)
-        return -hTemp - vTemp
-
-    def getCostUpdate(self,
-                      learningRate,
-                      persistent = None,
-                      k = 1):
-        preActivationph, phMean, phSample = self.sampleHgivenV(self.Input)
-
-        if persistent is None:
-            chainStart = phSample
+        # Calculate Gibbs Sample
+        if self.Persistent is None:
+            chainStart = self.sampleHGivenV(self.Input)
         else:
-            chainStart = persistent
+            chainStart = self.Persistent
+
         (
             [
-                preActivationNvs,
-                nvMeans,
-                nvSamples,
-                preActivationNhs,
-                nhMeans,
-                nhSamples
-            ]
-        ) = theano.scan(
-            self.gibbsHvh,
-            outputs_info = [None, None, None, None, None, chainStart],
-            n_steps = k
-        )
-        chainEnd = nvSamples[-1]
+                vSample,
+                hSample
+            ],
+            updates
+        ) = theano.scan(fn           = self.gibbsSampleHvH,
+                        outputs_info = [None, chainStart],
+                        n_steps      = self.kGibbsSample)
+        chainEnd = vSample[-1]
+        updates[self.Persistent] = hSample[-1]
 
-        cost = T.mean(self.freeEnergy(self.Input)) - T.mean(self.freeEnergy(chainEnd))
-        grads = T.grad(cost, self.Params, consider_constant=[chainEnd])
-        updates = [(param, param - learningRate * grad)
-                   for param, grad in zip(self.Params, grads)]
+        # Calculate cost function
+        self.Cost = T.mean(self.freeEnergy(self.Input)) - T.mean(self.freeEnergy(chainEnd))
+        self.MonitoringCost = self.getPseudoLikeLihoodCost(updates)
 
-        if persistent is not None:
-            updates[persistent] = self.getPseudoLikelihoodCost(updates)
-        else:
-            monitoringCost = self.getReconstructionCost(preActivationNvs[-1])
+        # Calculate grad
+        self.Grads = T.grad(self.Cost, self.Params)
 
-        return [monitoringCost, updates]
+        for (param, grad) in zip(self.Params, self.Grads):
+            updates[param] = param - self.LearningRate * grad
 
-    def getPseudoLikelihoodCost(self, updates):
-        bit_i_idx = theano.shared(value=0, name='bit_i_idx')
+        self.Updates = updates
 
-        # binarize the input image by rounding to nearest integer
-        xi = T.round(self.input)
+    def propUp(self, visible):
+        return self.Activation(T.dot(visible, self.W) + self.hBias)
 
-        # calculate free energy for the given bit configuration
-        fe_xi = self.freeEnergy(xi)
+    def sampleHGivenV(self, visible):
+        h1Mean = self.propUp(visible)
+        h1Sample = self.TheanoRng.binomial(size  = h1Mean.shape,
+                                           n     = 1,
+                                           p     = h1Mean,
+                                           dtype = theano.config.floatX)
+        return h1Sample
 
-        # flip bit x_i of matrix xi and preserve all other bits x_{\i}
-        # Equivalent to xi[:,bit_i_idx] = 1-xi[:, bit_i_idx], but assigns
-        # the result to xi_flip, instead of working in place on xi.
-        xi_flip = T.set_subtensor(xi[:, bit_i_idx], 1 - xi[:, bit_i_idx])
+    def propDown(self, hidden):
+        return self.Activation(T.dot(hidden, self.W.T) + self.vBias)
 
-        # calculate free energy with bit flipped
-        fe_xi_flip = self.freeEnergy(xi_flip)
+    def sampleVGivenH(self, hidden):
+        v1Mean = self.propDown(hidden)
+        v1Sample = self.TheanoRng.binomial(size  = v1Mean.shape,
+                                           n     = 1,
+                                           p     = v1Mean,
+                                           dtype = theano.config.floatX)
+        return v1Sample
 
-        # equivalent to e^(-FE(x_i)) / (e^(-FE(x_i)) + e^(-FE(x_{\i})))
-        cost = T.mean(self.numVisible * T.log(self.Activation(fe_xi_flip - fe_xi)))
+    def freeEnergy(self, visible):
+        bv  = - T.dot(visible, self.vBias.T)
+        cWv = - T.sum(T.log(1 + T.exp(T.dot(visible, self.W) + self.hBias)), axis = 1)
+        return bv + cWv
 
-        # increment bit_i_idx % number as part of updates
-        updates[bit_i_idx] = (bit_i_idx + 1) % self.NumVisible
+    def gibbsSampleHvH(self, hidden):
+        v1Sample = self.sampleVGivenH(hidden)
+        h1Sample = self.sampleHGivenV(v1Sample)
+        return [v1Sample, h1Sample]
+
+    def gibbsSampleVhV(self, visible):
+        h1Sample = self.sampleHGivenV(visible)
+        v1Sample = self.sampleVGivenH(h1Sample)
+        return [h1Sample, v1Sample]
+
+    def getPseudoLikeLihoodCost(self, updates):
+        bitIndex = theano.shared(value = 0, name = 'bitIndex')
+
+        xi = T.round(self.Input)
+        energyXi = self.freeEnergy(xi)
+        xiFlip = T.set_subtensor(xi[:, bitIndex], 1 - xi[:, bitIndex])
+        energyXiFlip = self.freeEnergy(xiFlip)
+
+        # Use log likelihood to calculate cost
+        cost = T.mean(self.NumVisible * T.log(self.Activation(energyXiFlip - energyXi)))
+
+        updates[bitIndex] = (bitIndex + 1) % self.NumVisible
 
         return cost
-
-    def getReconstructioinCost(self, preActivationNv):
-        crossEntropy = T.mean(
-            T.sum(
-                self.Input * T.log(self.Activation(preActivationNv)) + (1 - self.Input) * T.log(1 - self.Activation(preActivationNv)),
-                axis = 1
-            )
-        )
-        return crossEntropy

@@ -1,7 +1,7 @@
 import Utils.DataHelper as DataHelper
-from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from PIL import Image
 from Utils.FilterHelper import *
+from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
 # Import layers
 from Layers.RBMHiddenLayer import *
